@@ -20,6 +20,8 @@ def get_imports(pe_object):
     for entry in pe_object.DIRECTORY_ENTRY_IMPORT:
         dll_name = entry.dll.decode('utf-8')
         for imp in entry.imports:
+            if not imp.name:
+                print(hex(imp.address), imp.ordinal)
             if dll_name in imports:
                 imports[dll_name].append(imp)
             else:
@@ -69,10 +71,16 @@ def get_named_address_function_list(pe_object):
     imports = get_imports(pe_object)
     for key, value in imports.items():
         for import_function in value:
+            if not import_function.name:
+                functions[import_function.address] = key + '!Ordinal_' + str(import_function.ordinal)
+                continue
             functions[import_function.address] = key + '!' + import_function.name.decode('utf-8')
     
     exports = get_exports(pe_object)
     for exported_function in exports:
+        if not exported_function.name:
+                functions[pe_object.OPTIONAL_HEADER.ImageBase + exported_function.address] = 'local!' + str(exported_function.ordinal)
+                continue
         functions[pe_object.OPTIONAL_HEADER.ImageBase + exported_function.address] = 'local!' + exported_function.name.decode('utf-8')
 
     functions[pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.Reserved2] = 'local!GuardCFDispatcherFunction'
@@ -152,9 +160,12 @@ def get_calls(pe_object, pe_file, virtual_addr, size):
     for instr in decoder:
         mnemonic_str = formatter.format_mnemonic(instr, FormatMnemonicOptions.NO_PREFIXES)
         operands_str = formatter.format_all_operands(instr)
-        #print(mnemonic_str, operands_str)
         if mnemonic_str == 'call':
-            call_list.append(get_operand_address(operands_str))
+            try:
+                call_list.append(get_operand_address(operands_str))
+            except Exception as e:
+                print("[x] Error parsing operand at: ", hex(virtual_addr))
+                print(str(e))
     
     return call_list
 
@@ -190,13 +201,12 @@ def resolve_call_name(pe_object, pe_file, indexable_function_table, virtual_addr
 
     if call_file_addr[1] != '.text':
         if virtual_address not in indexable_function_table.keys():
-            raise Exception("Error looking for call in : %s" % hex(virtual_address))
-        
-        return indexable_function_table[virtual_address]
+            addr = int.from_bytes(read_from_offset(pe_file, call_file_addr[0], 8), 'little')
+            print("Found rel call to: ", hex(addr))
+            if addr not in indexable_function_table.keys():
+                return "local!Function_" + hex(addr)
 
-    if call_file_addr[1] != '.text':
-        if virtual_address not in indexable_function_table.keys():
-            raise Exception("Error looking for call in : %s" % hex(virtual_address))
+            return indexable_function_table[addr]
         
         return indexable_function_table[virtual_address]
     
@@ -236,22 +246,24 @@ def get_all_function_calls(dll_path):
     pe_file = open(file_path, "rb")
     pe.parse_data_directories()
     indexable_function_table = get_named_address_function_list(pe)
-
     function_addr_list = get_function_addresses(pe, pe_file)
+
+    print(0x180046664 in function_addr_list)
+
     if not function_addr_list:
         raise Exception("[x] Couldnt find functions")
 
     for entry in range(0,len(function_addr_list)-1):
-        try:
-            list = get_named_calls_by_cfg_index(pe, pe_file, indexable_function_table, function_addr_list, entry)
-            if function_addr_list[entry] in indexable_function_table.keys():
-                calls[indexable_function_table[function_addr_list[entry]]] = list
-                continue
+        #try:
+        list = get_named_calls_by_cfg_index(pe, pe_file, indexable_function_table, function_addr_list, entry)
+        if function_addr_list[entry] in indexable_function_table.keys():
+            calls[indexable_function_table[function_addr_list[entry]]] = list
+            continue
 
-            calls['Function_' + hex(function_addr_list[entry])] = list
-        except Exception as e: # work on python 3.x
-            print("[x] Error in fucntion at: ", hex(function_addr_list[entry]))
-            print(str(e))
+        calls['local!Function_' + hex(function_addr_list[entry])] = list
+        #except Exception as e: # work on python 3.x
+        #    print("[x] Error in function at: ", hex(function_addr_list[entry]))
+        #    print(str(e))
 
     return calls
 
@@ -264,6 +276,7 @@ if __name__ == '__main__':
     pe.parse_data_directories()
     indexable_function_table = get_named_address_function_list(pe)
 
+    
     function_addr_list = get_function_addresses(pe, pe_file)
     if function_addr_list:
         
@@ -274,4 +287,5 @@ if __name__ == '__main__':
             print('\t[-] Call to:', call)
     else:
         print('[x] ERROR: No functions found')
+    
     
