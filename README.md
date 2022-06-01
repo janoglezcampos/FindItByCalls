@@ -1,6 +1,8 @@
 # FindItByCalls
 Hacky code for extracting calls in DLLs by function
 
+Doesnt require loading library
+
 Find an usage example in GetCalls.py
 
 Notes:
