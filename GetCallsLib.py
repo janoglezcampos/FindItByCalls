@@ -1,12 +1,14 @@
 import pefile
 from iced_x86 import *
 
-CFG_ENTRY_SIZE = 0x5;
+IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK = 0xf0000000;
+IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT = 0x1c;
 
 def resolve_file_address(pe_object,virtual_address):
     base = pe_object.OPTIONAL_HEADER.ImageBase
     header_size = pe_object.NT_HEADERS.OPTIONAL_HEADER.SizeOfHeaders
     size_count = header_size
+    
     for section in pe_object.sections:
         if(virtual_address >= base + section.VirtualAddress and virtual_address < base + section.VirtualAddress+section.SizeOfRawData):
             return (size_count + (virtual_address - (base + section.VirtualAddress)), section.Name.decode('utf-8').rstrip('\x00'))
@@ -17,33 +19,69 @@ def resolve_file_address(pe_object,virtual_address):
 
 def get_imports(pe_object):
     imports = {}
-    for entry in pe_object.DIRECTORY_ENTRY_IMPORT:
-        dll_name = entry.dll.decode('utf-8')
-        for imp in entry.imports:
-            if dll_name in imports:
-                imports[dll_name].append(imp)
-            else:
-                imports[dll_name] = [imp]
+    try:
+        for entry in pe_object.DIRECTORY_ENTRY_IMPORT:
+            dll_name = entry.dll.decode('utf-8')
+            for imp in entry.imports:
+                if dll_name in imports:
+                    imports[dll_name].append(imp)
+                else:
+                    imports[dll_name] = [imp]
+    except AttributeError:
+        print("[x] Error: No DIRECTORY_ENTRY_IMPORT")
     return imports
 
 def get_exports(pe_object):
     exports = []
-    for entry in pe_object.DIRECTORY_ENTRY_EXPORT.symbols:
-        #print(hex(pe_object.OPTIONAL_HEADER.ImageBase + entry.address), entry.name, entry.ordinal)
-        exports.append(entry)
+    try:
+        for entry in pe_object.DIRECTORY_ENTRY_EXPORT.symbols:
+            #print(hex(pe_object.OPTIONAL_HEADER.ImageBase + entry.address), entry.name, entry.ordinal)
+            exports.append(entry)
+    except AttributeError:
+        print("[x] Error: No DIRECTORY_ENTRY_EXPORT")
     return exports
 
 def get_exception_table_functions(pe_object):
     functions = []
-    for entry in pe_object.DIRECTORY_ENTRY_EXCEPTION:
-        #print(hex(pe_object.OPTIONAL_HEADER.ImageBase + entry.address), entry.name, entry.ordinal)
-        functions.append(pe_object.OPTIONAL_HEADER.ImageBase + entry.struct.BeginAddress)
+    try:
+        for entry in pe_object.DIRECTORY_ENTRY_EXCEPTION:
+            #print(hex(pe_object.OPTIONAL_HEADER.ImageBase + entry.address), entry.name, entry.ordinal)
+            functions.append(pe_object.OPTIONAL_HEADER.ImageBase + entry.struct.BeginAddress)
+
+    except AttributeError:
+        print("[x] Error: No DIRECTORY_ENTRY_EXCEPTION")
     return functions
+
+#if va_format = True the table is filled with virtual address, if False, is filled with the file address
+def get_cfg_table(pe_object, pe_file, va_format = True):
+    cfg_table = []
+    
+    try:
+        cgf_lags = pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardFlags
+        padding_size = (cgf_lags &
+			IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK) >> IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT;
+        cfg_entry_size = padding_size + 4
+        cfg_table_size = pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionCount * cfg_entry_size
+        cfg_table_file_addr = resolve_file_address(pe_object, pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionTable)[0]
+        cfg_table_bytes = read_from_offset(pe_file, cfg_table_file_addr, cfg_table_size)
+
+        for function_count in range(0, pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionCount):
+            base = pe_object.OPTIONAL_HEADER.ImageBase
+            entry_offset = function_count * cfg_entry_size
+            addr = base + int.from_bytes(cfg_table_bytes[entry_offset : entry_offset+4], "little")
+            if not va_format:
+                addr = resolve_file_address(pe_object, addr)[0]
+            cfg_table.append(addr)
+    except AttributeError:
+        print("[x] Error: No DIRECTORY_ENTRY_LOAD_CONFIG")
+    return cfg_table
 
 def filter_functions(pe_object, function_list):
     function_list.sort()
     new_function_list = []
     for function_addr in function_list:
+        if not resolve_file_address(pe_object, function_addr):
+            print("[x] Error: Found function out of bound: %s" % hex(function_addr))
         if resolve_file_address(pe_object, function_addr)[1] != '.text':
             break
         new_function_list.append(function_addr)
@@ -52,7 +90,6 @@ def filter_functions(pe_object, function_list):
 
 def get_function_addresses(pe_object, pe_file):
     functions = get_cfg_table(pe_object, pe_file)
-
     for addr in get_exception_table_functions(pe_object):
         if addr not in functions:
             functions.append(addr)
@@ -61,7 +98,7 @@ def get_function_addresses(pe_object, pe_file):
         addr = pe_object.OPTIONAL_HEADER.ImageBase + entry.address
         if addr not in functions:
             functions.append(addr)
-    
+
     return filter_functions(pe_object, functions)
 
 def get_named_address_function_list(pe_object):
@@ -101,27 +138,6 @@ def read_from_offset(file, offset, size):
     file.seek(offset, 0)
     return file.read(size)
 
-#if va_format = True the table is filled with virtual address, if False, is filled with the file address
-def get_cfg_table(pe_object, pe_file, va_format = True):
-    cfg_table = []
-    
-    if not pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionTable:
-        return 
-
-    cfg_table_size = pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionCount * CFG_ENTRY_SIZE
-    cfg_table_file_addr = resolve_file_address(pe_object, pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionTable)[0]
-    cfg_table_bytes = read_from_offset(pe_file, cfg_table_file_addr, cfg_table_size)
-
-    for function_count in range(0, pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionCount):
-        base = pe_object.OPTIONAL_HEADER.ImageBase
-        entry_offset = function_count * CFG_ENTRY_SIZE
-        addr = base + int.from_bytes(cfg_table_bytes[entry_offset : entry_offset+4], "little")
-        if not va_format:
-            addr = resolve_file_address(pe_object, addr)[0]
-        cfg_table.append(addr)
-
-    return cfg_table
-
 def dissasemble_function(pe_object, pe_file, virtual_addr, size):
     file_addr = resolve_file_address(pe_object, virtual_addr)[0]
     function_content = read_from_offset(pe_file, file_addr, size)
@@ -137,13 +153,14 @@ def dissasemble_function(pe_object, pe_file, virtual_addr, size):
 
 def get_operand_address(operands_str):
     if '[' in operands_str and ']' in operands_str:
-        lea_content = operands_str[operands_str.index('[') + 1:operands_str.index(']')]
-        for val in lea_content.split(" "):
-            if val.endswith('h'):
+        rel_content = operands_str[operands_str.index('[') + 1:operands_str.index(']')]
+        for val in rel_content.split(" "):
+            if val.endswith('h') and '+' not in val:
                 return int(val.rstrip('h'), 16)
     else:
-        if operands_str.endswith('h'):
-            return int(operands_str.rstrip('h'), 16)
+        if operands_str.endswith('h') and '+' not in operands_str:
+            addr_operand = operands_str.split(" ")[-1]
+            return int(addr_operand.rstrip('h'), 16)
     raise Exception("[x] Error: Couldnt parse operand: %s" % operands_str)
 
 def get_calls(pe_object, pe_file, virtual_addr, size):
@@ -248,12 +265,14 @@ def get_all_function_calls(dll_path):
     pe =  pefile.PE(file_path)
     pe_file = open(file_path, "rb")
     pe.parse_data_directories()
-    indexable_function_table = get_named_address_function_list(pe)
+
     function_addr_list = get_function_addresses(pe, pe_file)
 
     if not function_addr_list:
-        raise Exception("[x] Couldnt find functions")
+        print("[x] Error: Couldnt find functions")
+        return calls
 
+    indexable_function_table = get_named_address_function_list(pe)
     for entry in range(0,len(function_addr_list)-1):
         #try:
         list = get_named_calls_by_cfg_index(pe, pe_file, indexable_function_table, function_addr_list, entry)
@@ -275,12 +294,10 @@ if __name__ == '__main__':
     pe =  pefile.PE(file_path)
     pe_file = open(file_path, "rb")
     pe.parse_data_directories()
-    indexable_function_table = get_named_address_function_list(pe)
-
-    
     function_addr_list = get_function_addresses(pe, pe_file)
+    print("whut", function_addr_list)
     if function_addr_list:
-        
+        indexable_function_table = get_named_address_function_list(pe)
         print('[+] Finding calls by:', hex(function_address))
         call_names = get_named_calls_by_function_address(pe, pe_file, indexable_function_table, function_addr_list, function_address)
 
