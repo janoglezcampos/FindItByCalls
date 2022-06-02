@@ -13,15 +13,13 @@ def resolve_file_address(pe_object,virtual_address):
         else:
             size_count+=section.SizeOfRawData
     
-    return 0
+    return
 
 def get_imports(pe_object):
     imports = {}
     for entry in pe_object.DIRECTORY_ENTRY_IMPORT:
         dll_name = entry.dll.decode('utf-8')
         for imp in entry.imports:
-            if not imp.name:
-                print(hex(imp.address), imp.ordinal)
             if dll_name in imports:
                 imports[dll_name].append(imp)
             else:
@@ -146,7 +144,7 @@ def get_operand_address(operands_str):
     else:
         if operands_str.endswith('h'):
             return int(operands_str.rstrip('h'), 16)
-    raise Exception("Couldnt parse address for operand: %s" % operands_str)
+    raise Exception("[x] Error: Couldnt parse operand: %s" % operands_str)
 
 def get_calls(pe_object, pe_file, virtual_addr, size):
     file_addr = resolve_file_address(pe_object, virtual_addr)[0]
@@ -160,11 +158,16 @@ def get_calls(pe_object, pe_file, virtual_addr, size):
     for instr in decoder:
         mnemonic_str = formatter.format_mnemonic(instr, FormatMnemonicOptions.NO_PREFIXES)
         operands_str = formatter.format_all_operands(instr)
+        #print(mnemonic_str, operands_str)
         if mnemonic_str == 'call':
             try:
+                operand_addr = get_operand_address(operands_str)
+                if not resolve_file_address(pe_object, operand_addr):
+                    raise Exception("[x] Error: Address out of bounds")
+                    
                 call_list.append(get_operand_address(operands_str))
             except Exception as e:
-                print("[x] Error parsing operand at: ", hex(virtual_addr))
+                print("[x] Error: Couldnt parse operand at: ", hex(virtual_addr))
                 print(str(e))
     
     return call_list
@@ -195,14 +198,13 @@ def is_instruction_jump(pe_object, pe_file, virtual_address):
 #   At the moment it doesnt resolve dalay loaded modules
 def resolve_call_name(pe_object, pe_file, indexable_function_table, virtual_address):
     call_file_addr = resolve_file_address(pe_object,virtual_address)
-
+    
     if call_file_addr[1] == '.didat':
         return 'local!DelayedDllFunction_' + hex(virtual_address)
 
     if call_file_addr[1] != '.text':
         if virtual_address not in indexable_function_table.keys():
             addr = int.from_bytes(read_from_offset(pe_file, call_file_addr[0], 8), 'little')
-            print("Found rel call to: ", hex(addr))
             if addr not in indexable_function_table.keys():
                 return "local!Function_" + hex(addr)
 
@@ -220,6 +222,7 @@ def resolve_call_name(pe_object, pe_file, indexable_function_table, virtual_addr
     return resolve_call_name(pe_object, pe_file, indexable_function_table, is_jmp)
 
 def get_named_calls_by_cfg_index(pe_object, pe_file, indexable_function_table, function_addr_list, list_index):
+    #print("Parsing function from: %s to %s" % (hex(function_addr_list[list_index]), hex(function_addr_list[list_index+1])))
     call_list = get_calls(pe_object, pe_file, function_addr_list[list_index], function_addr_list[list_index+1] - function_addr_list[list_index])
 
     call_names = []
@@ -247,8 +250,6 @@ def get_all_function_calls(dll_path):
     pe.parse_data_directories()
     indexable_function_table = get_named_address_function_list(pe)
     function_addr_list = get_function_addresses(pe, pe_file)
-
-    print(0x180046664 in function_addr_list)
 
     if not function_addr_list:
         raise Exception("[x] Couldnt find functions")
@@ -287,5 +288,3 @@ if __name__ == '__main__':
             print('\t[-] Call to:', call)
     else:
         print('[x] ERROR: No functions found')
-    
-    
