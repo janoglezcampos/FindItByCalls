@@ -11,4 +11,4 @@ Notes:
   * local!\<function name\> if the function was found in the export table
   * local!Function_0x\<function address in hex\> if the name couldnt be resolved
   * Function names from delay loaded libraries are no resolved (yet)
-  * Switch statements blow my "decompiler" :)
+  * Switch statements blow my "decompiler", still thinking on a work around :)
