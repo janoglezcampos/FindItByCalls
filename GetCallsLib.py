@@ -4,19 +4,16 @@ from iced_x86 import *
 IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK = 0xf0000000;
 IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT = 0x1c;
 
+#Returns the address in file and its section
 def resolve_file_address(pe_object,virtual_address):
     base = pe_object.OPTIONAL_HEADER.ImageBase
-    header_size = pe_object.NT_HEADERS.OPTIONAL_HEADER.SizeOfHeaders
-    size_count = header_size
-    
     for section in pe_object.sections:
-        if(virtual_address >= base + section.VirtualAddress and virtual_address < base + section.VirtualAddress+section.SizeOfRawData):
-            return (size_count + (virtual_address - (base + section.VirtualAddress)), section.Name.decode('utf-8').rstrip('\x00'))
-        else:
-            size_count+=section.SizeOfRawData
+        if(virtual_address >= base + section.VirtualAddress and virtual_address < base + section.VirtualAddress + section.Misc_VirtualSize):
+            return (section.PointerToRawData + (virtual_address - (base + section.VirtualAddress)), section.Name.decode('utf-8').rstrip('\x00'))
     
     return
 
+#Returns a list with imported functions (pefile entry type)
 def get_imports(pe_object):
     imports = {}
     try:
@@ -31,6 +28,7 @@ def get_imports(pe_object):
         print("[x] Error: No DIRECTORY_ENTRY_IMPORT")
     return imports
 
+#Returns a list with exported functions (pefile entry type)
 def get_exports(pe_object):
     exports = []
     try:
@@ -41,6 +39,7 @@ def get_exports(pe_object):
         print("[x] Error: No DIRECTORY_ENTRY_EXPORT")
     return exports
 
+#Returns a list with functions in the exception table
 def get_exception_table_functions(pe_object):
     functions = []
     try:
@@ -53,15 +52,24 @@ def get_exception_table_functions(pe_object):
     return functions
 
 #if va_format = True the table is filled with virtual address, if False, is filled with the file address
-def get_cfg_table(pe_object, pe_file, va_format = True):
+#Returns a list with functions in the cfg table
+def get_cfg_table_function(pe_object, pe_file, va_format = True):
     cfg_table = []
     
     try:
+        #Found 32 bits structure in 64 bit pe, since I dont have idea on how to detect this in other way, this is my workaround
+        if  pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.Size == 0x70 or \
+            pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionCount == 0:
+            return cfg_table
+
         cgf_lags = pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardFlags
         padding_size = (cgf_lags &
 			IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK) >> IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT;
         cfg_entry_size = padding_size + 4
         cfg_table_size = pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionCount * cfg_entry_size
+
+
+        
         cfg_table_file_addr = resolve_file_address(pe_object, pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.GuardCFFunctionTable)[0]
         cfg_table_bytes = read_from_offset(pe_file, cfg_table_file_addr, cfg_table_size)
 
@@ -74,22 +82,26 @@ def get_cfg_table(pe_object, pe_file, va_format = True):
             cfg_table.append(addr)
     except AttributeError:
         print("[x] Error: No DIRECTORY_ENTRY_LOAD_CONFIG")
+
     return cfg_table
 
+#Returns a list of function resulted of removing functions out of .text (some cfg added functions are imports)
 def filter_functions(pe_object, function_list):
     function_list.sort()
     new_function_list = []
     for function_addr in function_list:
         if not resolve_file_address(pe_object, function_addr):
-            print("[x] Error: Found function out of bound: %s" % hex(function_addr))
+            print("[x] Warning: Found function out of bounds: %s" % hex(function_addr))
+            
         if resolve_file_address(pe_object, function_addr)[1] != '.text':
             break
         new_function_list.append(function_addr)
     
     return new_function_list
 
-def get_function_addresses(pe_object, pe_file):
-    functions = get_cfg_table(pe_object, pe_file)
+#Returns a list contaning functions form exports, cfg table and exceptions table
+def get_function_list(pe_object, pe_file):
+    functions = get_cfg_table_function(pe_object, pe_file)
     for addr in get_exception_table_functions(pe_object):
         if addr not in functions:
             functions.append(addr)
@@ -101,7 +113,8 @@ def get_function_addresses(pe_object, pe_file):
 
     return filter_functions(pe_object, functions)
 
-def get_named_address_function_list(pe_object):
+#Returns a dictionary with functions wich names are avaliable indexed by their address
+def get_function_names(pe_object):
     functions = {}
     imports = get_imports(pe_object)
     for key, value in imports.items():
@@ -117,11 +130,15 @@ def get_named_address_function_list(pe_object):
                 functions[pe_object.OPTIONAL_HEADER.ImageBase + exported_function.address] = 'local!' + str(exported_function.ordinal)
                 continue
         functions[pe_object.OPTIONAL_HEADER.ImageBase + exported_function.address] = 'local!' + exported_function.name.decode('utf-8')
-
-    functions[pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.Reserved2] = 'local!GuardCFDispatcherFunction'
+    
+    try:
+        functions[pe_object.DIRECTORY_ENTRY_LOAD_CONFIG.struct.Reserved2] = 'local!GuardCFDispatcherFunction'
+    except:
+        print("[x] Warning: no CFG info found")
 
     return functions
 
+#Return address of function by name
 def get_funct_address(pe_object,function_name):
     imports = get_imports(pe_object)
     for imported_functions in imports.values():
@@ -134,23 +151,12 @@ def get_funct_address(pe_object,function_name):
         if function_name in entry.name.decode('utf-8'):
             return pe_object.OPTIONAL_HEADER.ImageBase + entry.address
 
+#Returns size bytes readed from offset in file
 def read_from_offset(file, offset, size):
     file.seek(offset, 0)
     return file.read(size)
 
-def dissasemble_function(pe_object, pe_file, virtual_addr, size):
-    file_addr = resolve_file_address(pe_object, virtual_addr)[0]
-    function_content = read_from_offset(pe_file, file_addr, size)
-    ip = virtual_addr
-    decoder = Decoder(64, function_content, ip = ip)
-    formatter = Formatter(FormatterSyntax.NASM)
-    for instr in decoder:
-        #disasm = formatter.format(instr)
-        mnemonic_str = formatter.format_mnemonic(instr, FormatMnemonicOptions.NO_PREFIXES)
-        operands_str = formatter.format_all_operands(instr)
-        if mnemonic_str != 'int3':
-            print(mnemonic_str, '\t', operands_str)
-
+#Returns the address of the operand with care of being relative
 def get_operand_address(operands_str):
     if '[' in operands_str and ']' in operands_str:
         rel_content = operands_str[operands_str.index('[') + 1:operands_str.index(']')]
@@ -163,6 +169,7 @@ def get_operand_address(operands_str):
             return int(addr_operand.rstrip('h'), 16)
     raise Exception("[x] Error: Couldnt parse operand: %s" % operands_str)
 
+#Returns a list of address called by the function
 def get_calls(pe_object, pe_file, virtual_addr, size):
     file_addr = resolve_file_address(pe_object, virtual_addr)[0]
     function_content = read_from_offset(pe_file, file_addr, size)
@@ -180,16 +187,17 @@ def get_calls(pe_object, pe_file, virtual_addr, size):
             try:
                 operand_addr = get_operand_address(operands_str)
                 if not resolve_file_address(pe_object, operand_addr):
-                    raise Exception("[x] Error: Address out of bounds")
+                    raise Exception("[x] Error: Called address out of bounds")
                     
-                call_list.append(get_operand_address(operands_str))
+                call_list.append(operand_addr)
             except Exception as e:
-                print("[x] Error: Couldnt parse operand at: ", hex(virtual_addr))
+                print("[x] Error: Couldnt parse operand of call at: ", hex(virtual_addr))
                 print(str(e))
     
     return call_list
 
-def is_instruction_jump(pe_object, pe_file, virtual_address):
+#Check if the the content of the addr is a jump, use case is thunked functions
+def is_instruction_jump_to_address(pe_object, pe_file, virtual_address):
     file_addr = resolve_file_address(pe_object,virtual_address)
     if file_addr[1] != '.text':
         return False
@@ -201,8 +209,18 @@ def is_instruction_jump(pe_object, pe_file, virtual_address):
     operands_str = formatter.format_all_operands(instr)
     if mnemonic_str != 'jmp':
         return False
+
+    try:
+        operand_addr = get_operand_address(operands_str)
+        if not resolve_file_address(pe_object, operand_addr):
+            raise Exception("[x] Error: Jump address out of bounds")
+            
+        return operand_addr
+    except Exception as e:
+        print("[x] Error: Couldnt parse operand of jump at: ", hex(virtual_address))
+        print(str(e))
     
-    return get_operand_address(operands_str)
+    return False
 
 
 #Call can go to: 
@@ -228,8 +246,9 @@ def resolve_call_name(pe_object, pe_file, indexable_function_table, virtual_addr
             return indexable_function_table[addr]
         
         return indexable_function_table[virtual_address]
-    
-    is_jmp = is_instruction_jump(pe_object,pe_file,virtual_address)
+
+    is_jmp = is_instruction_jump_to_address(pe_object,pe_file,virtual_address)
+
     if not is_jmp:
         if virtual_address not in indexable_function_table.keys():
             return "local!Function_" + hex(virtual_address)
@@ -266,13 +285,13 @@ def get_all_function_calls(dll_path):
     pe_file = open(file_path, "rb")
     pe.parse_data_directories()
 
-    function_addr_list = get_function_addresses(pe, pe_file)
+    function_addr_list = get_function_list(pe, pe_file)
 
+    indexable_function_table = get_function_names(pe)
     if not function_addr_list:
         print("[x] Error: Couldnt find functions")
         return calls
 
-    indexable_function_table = get_named_address_function_list(pe)
     for entry in range(0,len(function_addr_list)-1):
         #try:
         list = get_named_calls_by_cfg_index(pe, pe_file, indexable_function_table, function_addr_list, entry)
@@ -294,10 +313,10 @@ if __name__ == '__main__':
     pe =  pefile.PE(file_path)
     pe_file = open(file_path, "rb")
     pe.parse_data_directories()
-    function_addr_list = get_function_addresses(pe, pe_file)
+    function_addr_list = get_function_names(pe, pe_file)
     print("whut", function_addr_list)
     if function_addr_list:
-        indexable_function_table = get_named_address_function_list(pe)
+        indexable_function_table = get_function_names(pe)
         print('[+] Finding calls by:', hex(function_address))
         call_names = get_named_calls_by_function_address(pe, pe_file, indexable_function_table, function_addr_list, function_address)
 
